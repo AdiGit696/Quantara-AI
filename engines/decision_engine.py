@@ -26,112 +26,125 @@ def evaluate_decision(
     pattern_text,
     fundamentals=None
 ):
-    """
-    Weighted swing decision with explicit contradiction gates.
-
-    A BUY is impossible when the forecast is below current price, when the
-    broader trend is down, or when risk-reward is poor.
-    """
     reasons = []
-    score = 0.0
-
     expected_return = prediction.get("expected_return_pct", 0.0)
     predicted_price = prediction.get("future_30", current_price)
 
-    if predicted_price < current_price or expected_return <= 0:
-        reasons.append("Forecast is not positive")
-        forecast_gate = False
-    else:
-        forecast_gate = True
-        score += min(expected_return / 2.0, 2.0)
-        reasons.append(f"30d forecast upside {expected_return:.1f}%")
-
+    technical = 50.0
     if trend == "Uptrend":
-        score += 2.0
+        technical += 18
         reasons.append("Daily and weekly trend align upward")
     elif trend == "Sideways":
-        score += 0.5
-        reasons.append("Trend is sideways")
+        technical += 4
+        reasons.append("Trend is sideways but not broken")
     else:
-        score -= 2.0
+        technical -= 16
         reasons.append("Trend is down")
 
-    if 45 <= rsi <= 65:
-        score += 1.0
+    if 45 <= rsi <= 68:
+        technical += 8
         reasons.append("RSI is in a constructive swing zone")
     elif rsi < 35:
-        score += 0.5
-        reasons.append("RSI is oversold; wait for confirmation")
-    elif rsi > 72:
-        score -= 1.5
+        technical += 3
+        reasons.append("RSI is oversold; confirmation still matters")
+    elif rsi > 74:
+        technical -= 8
         reasons.append("RSI is overheated")
 
     if macd_val > macd_signal:
-        score += 1.0
+        technical += 7
         reasons.append("MACD is bullish")
     else:
-        score -= 0.75
+        technical -= 4
         reasons.append("MACD is not bullish")
 
-    score += volume_info.get("score", 0.0)
+    technical += float(volume_info.get("score", 0.0) or 0) * 6
     reasons.append(volume_info.get("label", "Volume unavailable"))
 
-    structure_strength = structure.get("strength", 0)
-    if structure_strength > 0:
-        score += 1.0
-        reasons.append(structure.get("structure", "Positive structure"))
-    elif structure_strength < 0:
-        score -= 1.0
-        reasons.append(structure.get("structure", "Weak structure"))
-
+    structure_strength = float(structure.get("strength", 0) or 0)
+    technical += structure_strength * 7
     if structure.get("breakout") == "Bullish breakout":
-        score += 1.25
+        technical += 10
         reasons.append("Bullish breakout confirmed")
     elif structure.get("breakout") == "Bearish breakdown":
-        score -= 1.5
+        technical -= 12
         reasons.append("Bearish breakdown detected")
 
     if "Bearish" in pattern_text or "Breakdown" in pattern_text or "Distribution" in pattern_text:
-        score -= 1.0
+        technical -= 6
         reasons.append("Pattern risk is bearish")
     elif "Bullish" in pattern_text or "Breakout" in pattern_text or "Ascending" in pattern_text:
-        score += 0.75
+        technical += 5
         reasons.append("Pattern supports upside")
 
-    if fundamentals:
-        score += min(fundamentals.get("score", 0), 4) * 0.25
-
-    if risk_plan.get("risk_reward", 0) >= 2:
-        score += 1.25
-        reasons.append("Risk-reward is at least 1:2")
-    elif risk_plan.get("risk_reward", 0) >= 1.3:
-        score += 0.25
-        reasons.append("Risk-reward is acceptable but not ideal")
+    fund_score = float((fundamentals or {}).get("score", 50) or 50)
+    momentum = 50.0
+    if predicted_price >= current_price and expected_return > 0:
+        momentum += min(expected_return * 4.5, 30)
+        reasons.append(f"30d forecast upside {expected_return:.1f}%")
     else:
-        score -= 2.0
-        reasons.append("Risk-reward is poor")
+        momentum -= 12
+        reasons.append("Forecast is not positive")
+    momentum += 8 if trend == "Uptrend" else -8 if trend == "Downtrend" else 0
+    momentum += min(max((volume_info.get("ratio", 1) - 1) * 10, -8), 10)
 
-    if risk_plan.get("atr_pct", 0) > 6 and structure.get("breakout") != "Bullish breakout":
-        score -= 1.5
-        reasons.append("Volatility is high without breakout confirmation")
+    risk = 55.0
+    if risk_plan.get("risk_reward", 0) >= 2:
+        risk += 18
+        reasons.append("Risk-reward is at least 1:2")
+    elif risk_plan.get("risk_reward", 0) >= 1.8:
+        risk += 10
+        reasons.append("Risk-reward meets the minimum 1:1.8 rule")
+    else:
+        risk -= 22
+        reasons.append("Risk-reward is below the minimum rule")
 
-    risk_gate = risk_plan.get("risk_reward", 0) >= 1.3 and risk_plan.get("atr_pct", 0) <= 8
-    trend_gate = trend != "Downtrend"
+    risk -= min(float(risk_plan.get("risk_pct", 0) or 0), 12) * 1.8
+    if risk_plan.get("atr_pct", 0) > 6:
+        risk -= 8
+        reasons.append("Volatility is elevated")
+    if not risk_plan.get("is_tradeable", True):
+        risk -= 18
+        reasons.append(risk_plan.get("rejection_reason") or "Risk setup is not tradeable")
 
-    if not forecast_gate or not trend_gate or not risk_gate:
-        decision = "AVOID" if score < 3 else "HOLD"
-    elif score >= 6.5:
+    sentiment = 50.0
+    master_score = (
+        max(0, min(100, technical)) * 0.30
+        + max(0, min(100, fund_score)) * 0.25
+        + max(0, min(100, momentum)) * 0.20
+        + max(0, min(100, risk)) * 0.15
+        + sentiment * 0.10
+    )
+
+    if expected_return >= 8 and trend != "Downtrend" and risk_plan.get("risk_reward", 0) >= 1.8:
+        master_score = max(master_score, 66)
+        reasons.append("Strong expected return lifts the setup above neutral bias")
+
+    severe_risk = risk_plan.get("risk_reward", 0) < 1.2 or (trend == "Downtrend" and risk_plan.get("atr_pct", 0) > 7)
+    if severe_risk or not risk_plan.get("is_tradeable", True):
+        decision = "AVOID"
+    elif master_score >= 80:
+        decision = "STRONG BUY"
+    elif master_score >= 65:
         decision = "BUY"
-    elif score >= 4.0:
+    elif master_score >= 50:
         decision = "HOLD"
     else:
         decision = "AVOID"
 
-    confidence = int(max(5, min(95, 45 + (score * 6))))
+    confidence = int(max(5, min(95, master_score)))
 
     return {
         "decision": decision,
         "confidence": confidence,
-        "score": round(score, 2),
+        "score": round(master_score, 2),
+        "master_score": round(master_score, 2),
+        "score_components": {
+            "technical": round(max(0, min(100, technical)), 2),
+            "fundamentals": round(max(0, min(100, fund_score)), 2),
+            "momentum": round(max(0, min(100, momentum)), 2),
+            "risk": round(max(0, min(100, risk)), 2),
+            "sentiment": round(sentiment, 2),
+        },
         "reasons": reasons[:8]
     }

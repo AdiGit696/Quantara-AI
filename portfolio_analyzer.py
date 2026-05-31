@@ -3,6 +3,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from engines.data_service import get_price_history
+from engines.formatting import format_currency
 from engines.portfolio_engine import analyze_portfolio
 from ui_components import BLUE, CYAN, GREEN, YELLOW, apply_chart_theme, compact_alert, health_meter
 
@@ -12,6 +13,89 @@ BENCHMARKS = {
     "SENSEX": "^BSESN",
     "NIFTY BANK": "^NSEBANK",
 }
+
+TICKER_COLUMNS = {
+    "stock", "stock_name", "stockname", "company", "company_name", "companyname",
+    "symbol", "ticker", "stock_nameticker", "name", "scrip", "security", "security_name", "instrument",
+}
+QUANTITY_COLUMNS = {"quantity", "qty", "shares", "units", "holding", "holdings", "no_of_shares", "noofshares"}
+PRICE_COLUMNS = {"buy_price", "buyprice", "buy", "price", "avg_price", "average_price", "avg_cost", "average_cost", "cost", "cost_price"}
+
+
+def _normalize_column(col):
+    return "".join(ch for ch in str(col).strip().lower().replace(" ", "_") if ch.isalnum() or ch == "_")
+
+
+def _numeric_density(series):
+    if series is None:
+        return 0
+    return pd.to_numeric(series, errors="coerce").notna().mean()
+
+
+def _prepare_portfolio_frame(df):
+    if df is None or df.empty:
+        return pd.DataFrame(), ["Uploaded file is empty."]
+
+    original = df.copy()
+    normalized_columns = {_normalize_column(col): col for col in original.columns}
+    rename_map = {}
+    for normalized, original_col in normalized_columns.items():
+        compact = normalized.replace("_", "")
+        if normalized in TICKER_COLUMNS or compact in TICKER_COLUMNS:
+            rename_map[original_col] = "Ticker"
+        elif normalized in QUANTITY_COLUMNS or compact in QUANTITY_COLUMNS:
+            rename_map[original_col] = "Quantity"
+        elif normalized in PRICE_COLUMNS or compact in PRICE_COLUMNS:
+            rename_map[original_col] = "Buy_Price"
+
+    prepared = original.rename(columns=rename_map)
+    missing = {"Ticker", "Quantity", "Buy_Price"} - set(prepared.columns)
+
+    if missing and len(prepared.columns) >= 3:
+        candidates = list(prepared.columns[:8])
+        text_cols = sorted(candidates, key=lambda col: _numeric_density(prepared[col]))
+        numeric_cols = sorted(candidates, key=lambda col: _numeric_density(prepared[col]), reverse=True)
+        inferred = {}
+        if "Ticker" in missing and text_cols:
+            inferred[text_cols[0]] = "Ticker"
+        numeric_unused = [col for col in numeric_cols if col not in inferred]
+        if "Quantity" in missing and numeric_unused:
+            qty_col = min(numeric_unused, key=lambda col: pd.to_numeric(prepared[col], errors="coerce").median(skipna=True) if pd.to_numeric(prepared[col], errors="coerce").notna().any() else float("inf"))
+            inferred[qty_col] = "Quantity"
+            numeric_unused = [col for col in numeric_unused if col != qty_col]
+        if "Buy_Price" in missing and numeric_unused:
+            inferred[numeric_unused[0]] = "Buy_Price"
+        prepared = prepared.rename(columns=inferred)
+
+    missing = {"Ticker", "Quantity", "Buy_Price"} - set(prepared.columns)
+    if missing:
+        return pd.DataFrame(), [f"Missing required columns after normalization: {', '.join(sorted(missing))}."]
+
+    prepared = prepared[["Ticker", "Quantity", "Buy_Price"]].copy()
+    prepared["Ticker"] = prepared["Ticker"].astype(str).str.strip()
+    prepared["Quantity"] = pd.to_numeric(prepared["Quantity"], errors="coerce")
+    prepared["Buy_Price"] = pd.to_numeric(prepared["Buy_Price"], errors="coerce")
+
+    errors = []
+    invalid = prepared[
+        (prepared["Ticker"] == "")
+        | prepared["Ticker"].str.lower().isin({"nan", "none", "null"})
+        | prepared["Quantity"].isna()
+        | prepared["Buy_Price"].isna()
+        | (prepared["Quantity"] <= 0)
+        | (prepared["Buy_Price"] < 0)
+    ]
+    if not invalid.empty:
+        errors.append(f"Skipped {len(invalid)} invalid row(s) with missing stock, quantity, or buy price.")
+
+    prepared = prepared.dropna(subset=["Ticker", "Quantity", "Buy_Price"])
+    prepared = prepared[
+        (prepared["Ticker"] != "")
+        & ~prepared["Ticker"].str.lower().isin({"nan", "none", "null"})
+        & (prepared["Quantity"] > 0)
+        & (prepared["Buy_Price"] >= 0)
+    ]
+    return prepared, errors
 
 
 def _portfolio_growth_curve(holdings):
@@ -90,25 +174,18 @@ def _render_benchmark_analysis(output):
 
 
 def analyze_uploaded_portfolio(df):
-    required = {"Ticker", "Quantity", "Buy_Price"}
-    missing = required - set(df.columns)
-    if missing:
+    df, parse_errors = _prepare_portfolio_frame(df)
+    if df.empty:
         compact_alert(
             "Invalid portfolio file",
-            f"Missing required columns: {', '.join(sorted(missing))}. Expected Ticker, Quantity, Buy_Price.",
+            "Expected stock name/ticker, quantity, and buy price. Quantara could not infer those fields from this file.",
             level="error",
+            details="\n".join(parse_errors),
         )
         return None
 
-    df = df.copy()
-    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
-    df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce")
-    df["Buy_Price"] = pd.to_numeric(df["Buy_Price"], errors="coerce")
-    df = df.dropna(subset=["Ticker", "Quantity", "Buy_Price"])
-    df = df[(df["Ticker"] != "") & (df["Quantity"] > 0)]
-    if df.empty:
-        compact_alert("No valid holdings", "The uploaded file did not contain usable rows after validation.", level="error")
-        return None
+    if parse_errors:
+        compact_alert("Portfolio file cleaned", "Quantara skipped invalid rows and continued with the valid holdings.", level="warn", details="\n".join(parse_errors))
 
     generate_replacements = st.checkbox("Generate replacement ideas", value=False, help="Runs an additional fast batched scan. Keep off for the fastest portfolio load.")
     with st.spinner("Analyzing holdings in parallel..."):
@@ -124,8 +201,8 @@ def analyze_uploaded_portfolio(df):
 
     st.subheader("Portfolio Intelligence")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Current Value", f"Rs. {output['total_value']:.2f}")
-    c2.metric("Projected 30d", f"Rs. {output['future_value']:.2f}")
+    c1.metric("Current Value", format_currency(output["total_value"], ticker="NIFTY.NS"))
+    c2.metric("Projected 30d", format_currency(output["future_value"], ticker="NIFTY.NS"))
     c3.metric("Portfolio Health", f"{output['portfolio_score']:.0f}%")
     c4.metric("Aggregate Risk", f"{output['aggregate_risk']:.2f}%")
     health_meter(output["portfolio_score"])
@@ -136,37 +213,46 @@ def analyze_uploaded_portfolio(df):
             [{"Sector": sector, "Allocation %": pct} for sector, pct in output["sector_allocation"].items()],
             use_container_width=True
         )
+        from ui_components import csv_download
+        csv_download([{"Sector": sector, "Allocation %": pct} for sector, pct in output["sector_allocation"].items()], "quantara_portfolio_sector_allocation.csv", key="portfolio_sector_csv")
 
     if output["rebalance_suggestions"]:
         st.write("### Rebalancing Suggestions")
         st.dataframe(output["rebalance_suggestions"], use_container_width=True, hide_index=True)
+        from ui_components import csv_download
+        csv_download(output["rebalance_suggestions"], "quantara_portfolio_rebalancing.csv", key="portfolio_rebalance_csv")
 
     if output.get("replacement_suggestions"):
         st.write("### Intelligent Replacement Ideas")
         st.dataframe(output["replacement_suggestions"], use_container_width=True, hide_index=True)
+        from ui_components import csv_download
+        csv_download(output["replacement_suggestions"], "quantara_portfolio_replacements.csv", key="portfolio_replacements_csv")
 
     if output.get("errors"):
         compact_alert("Some holdings were skipped", "A few portfolio symbols could not be analyzed, but the rest of the report was generated.", level="warn", details="\n".join(output["errors"]))
 
-    st.write("### Benchmark Comparison")
-    if st.checkbox("Render benchmark comparison chart", value=False, help="Lazy-loads NIFTY/SENSEX benchmark data. Keep off for fastest portfolio switching."):
-        _render_benchmark_analysis(output)
-    else:
-        compact_alert("Benchmark chart ready", "Enable the benchmark chart when needed. It is lazy-loaded to keep portfolio analysis responsive.", level="info")
+    # Benchmark comparison removed for performance optimization
 
     st.write("### Holdings")
     rows = []
     for item in output["holdings"]:
         rows.append({
-            "Ticker": item["ticker"],
+            "Stock": item.get("display_name", item["ticker"]),
             "Sector": item["sector"],
-            "Decision": item["decision"],
-            "Confidence": item["trade_confidence"],
+            "Decision": item.get("portfolio_action", "HOLD"),
+            "Quantara Score": item.get("quantara_score", item.get("ai_score")),
             "Risk": item["risk_level"],
+            "Quantity": item["quantity"],
+            "Buy Price": round(item["buy_price"], 2),
+            "Current Price": round(item["price"], 2),
+            "Current Value": round(item["current_value"], 2),
+            "Allocation %": item.get("allocation_pct", 0),
             "P&L %": round(item["pnl_pct"], 2),
             "Expected 30d %": round(item["expected_return_pct"], 2),
             "Risk-Reward": round(item["risk_reward"], 2)
         })
     st.dataframe(rows, use_container_width=True)
+    from ui_components import csv_download
+    csv_download(rows, "quantara_portfolio_holdings.csv", key="portfolio_holdings_csv")
 
     return output

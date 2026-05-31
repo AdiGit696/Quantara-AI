@@ -1,4 +1,6 @@
 import html
+import re
+from datetime import datetime
 from base64 import b64encode
 from pathlib import Path
 
@@ -16,6 +18,7 @@ BLUE = "#1C8DFF"
 GREEN = "#17E6A5"
 RED = "#FF5E7A"
 YELLOW = "#F8C75A"
+ERROR_LOG = Path(__file__).parent / ".quantara" / "error_log.txt"
 
 
 def apply_chart_theme(fig, height=430, title=None):
@@ -184,17 +187,6 @@ def inject_theme():
     .insight-card b { color: var(--if-cyan); }
     .insight-card ul { margin-bottom: 0; padding-left: 1.2rem; color: var(--if-text); }
     .insight-card li { color: #C9E5F2 !important; }
-    .tv-wrap {
-        width: 100%;
-        height: min(72vh, 760px);
-        min-height: 560px;
-        border: 1px solid var(--if-border);
-        border-radius: 8px;
-        overflow: hidden;
-        background: var(--if-panel);
-        box-shadow: 0 18px 42px rgba(0, 0, 0, .20);
-    }
-    .tv-wrap > div { height: 100%; width: 100%; }
     .confidence-ring {
         --value: 50;
         --ring: conic-gradient(var(--if-green) calc(var(--value) * 1%), rgba(143,177,199,.14) 0);
@@ -333,7 +325,6 @@ def inject_theme():
     .health-meter { height: 12px; border-radius:999px; background:rgba(143,177,199,.12); overflow:hidden; border:1px solid rgba(98,245,255,.14); }
     .health-meter span { display:block; height:100%; border-radius:999px; background:linear-gradient(90deg, #FF5E7A, #F8C75A 46%, #17E6A5); }
     @media (max-width: 900px) {
-        .tv-wrap { min-height: 420px; height: 65vh; }
         .confidence-ring { width: 96px; height: 96px; }
         .confidence-ring::before { width: 70px; height: 70px; }
     }
@@ -385,6 +376,54 @@ def html_block(markup):
         st.markdown(markup, unsafe_allow_html=True)
 
 
+def csv_download(data, filename, label="Download CSV", key=None):
+    if data is None:
+        return
+    frame = data if isinstance(data, pd.DataFrame) else pd.DataFrame(data)
+    if frame.empty:
+        return
+    clean_filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename).strip("_")
+    if not clean_filename.lower().endswith(".csv"):
+        clean_filename = f"{clean_filename}.csv"
+    csv = frame.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label,
+        data=csv,
+        file_name=clean_filename,
+        mime="text/csv",
+        key=key or f"csv_{clean_filename}",
+        use_container_width=False,
+    )
+
+
+def stock_header_card(meta, result, formatter):
+    company = meta.get("longName") or meta.get("shortName") or meta.get("display_name") or meta.get("symbol")
+    items = [
+        ("Current Price", formatter(result.get("price"))),
+        ("Market Cap", formatter(meta.get("marketCap"), compact=True)),
+        ("Sector", meta.get("sector") or result.get("fundamentals", {}).get("metrics", {}).get("sector") or "Unknown"),
+        ("Industry", meta.get("industry") or result.get("fundamentals", {}).get("metrics", {}).get("industry") or "Unknown"),
+        ("Day Change", f"{result.get('day_change_pct', 0):+.2f}%"),
+        ("Quantara Score", f"{result.get('quantara_score', result.get('ai_score', 0)):.0f}/100"),
+        ("Risk Level", result.get("risk_level", "Unknown")),
+        ("Trend", result.get("trend", "Unknown")),
+    ]
+    tiles = "".join(
+        f"<div class='prob-tile'><b>{html.escape(label)}</b><span>{html.escape(str(value))}</span></div>"
+        for label, value in items
+    )
+    st.markdown(
+        f"""
+        <div class="insight-card">
+            <b>{html.escape(str(company))}</b>
+            <div style="color:#8FB1C7;margin-top:4px;">{html.escape(str(meta.get('sector') or result.get('trend') or 'Market intelligence'))}</div>
+        </div>
+        <div class="prob-grid">{tiles}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def section_help(title, body):
     st.markdown(
         f"""
@@ -404,13 +443,25 @@ def compact_alert(title, message, level="warn", details=None):
         unsafe_allow_html=True,
     )
     if details:
-        with st.expander("View details", expanded=False):
-            st.code(str(details))
+        try:
+            ERROR_LOG.parent.mkdir(exist_ok=True)
+            ERROR_LOG.write_text(
+                (ERROR_LOG.read_text(encoding="utf-8") if ERROR_LOG.exists() else "")
+                + f"\n[{datetime.now().isoformat(timespec='seconds')}] {title}\n{details}\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+        if level != "error":
+            with st.expander("View details", expanded=False):
+                st.code(str(details))
+        else:
+            st.caption("Technical details were logged for review.")
 
 
 def decision_badge(decision, confidence=None):
-    css = "buy" if decision == "BUY" else "avoid" if decision == "AVOID" else "hold"
-    if decision == "BUY" and confidence and confidence >= 75:
+    css = "buy" if decision in {"BUY", "STRONG BUY"} else "avoid" if decision == "AVOID" else "hold"
+    if decision == "STRONG BUY" or (decision == "BUY" and confidence and confidence >= 75):
         css = "strongbuy"
     st.markdown(f"<div class='{css}'>{html.escape(str(decision))}</div>", unsafe_allow_html=True)
 
@@ -428,7 +479,7 @@ def status_badge(label, score=None):
     st.markdown(f"<span class='status-badge {css}'>{html.escape(label_text)}</span>", unsafe_allow_html=True)
 
 
-def confidence_ring(value, label="Trade Confidence"):
+def confidence_ring(value, label="Quantara Score"):
     value = int(max(0, min(100, value or 0)))
     st.markdown(
         f"""
@@ -453,17 +504,43 @@ def health_meter(value):
 
 def probability_summary(model):
     factors = model.get("factors", [])
+    bullish = [item for item in factors if item.get("weight", 0) > 0]
+    bearish = [item for item in factors if item.get("weight", 0) < 0]
+    confidence = model.get("trade_confidence", 0)
+    uncertainty = model.get("uncertainty", 0)
+    if confidence >= 72 and uncertainty <= 24:
+        outlook = "Constructive bullish setup"
+    elif confidence >= 58:
+        outlook = "Selective opportunity with confirmation needed"
+    elif confidence >= 45:
+        outlook = "Mixed setup; patience is justified"
+    else:
+        outlook = "Weak probability profile"
+    bullish_text = "; ".join(str(item.get("explanation") or item.get("factor")) for item in bullish[:3]) or "No dominant bullish factor is strong enough yet."
+    bearish_text = "; ".join(str(item.get("explanation") or item.get("factor")) for item in bearish[:3]) or "No major bearish factor dominates the current setup."
     rows = "".join(
         f"<li><b>{html.escape(str(item.get('factor')))}</b>: {item.get('weight'):+.2f} - {html.escape(str(item.get('explanation')))}</li>"
         for item in factors[:6]
     )
     st.markdown(
         f"""
+        <div class="insight-card">
+            <b>Probability Summary</b>
+            <ul>
+                <li><b>Overall outlook:</b> {html.escape(outlook)}</li>
+                <li><b>Selected model:</b> {html.escape(str(model.get('model_name', 'Hybrid AI Scoring Model')))}</li>
+                <li><b>Confidence explanation:</b> {html.escape(str(model.get('selected_reason', 'Model selected from available probability evidence.')))}</li>
+                <li><b>Strongest bullish factors:</b> {html.escape(bullish_text)}</li>
+                <li><b>Strongest bearish factors:</b> {html.escape(bearish_text)}</li>
+                <li><b>Risk interpretation:</b> {html.escape(str(model.get('risk_level', 'Moderate')))} risk with {uncertainty}% model uncertainty.</li>
+            </ul>
+        </div>
         <div class="prob-grid">
             <div class="prob-tile"><b>Probability Score</b><span>{model.get('trade_confidence', 0)}%</span></div>
             <div class="prob-tile"><b>Model Used</b><span>{html.escape(str(model.get('model_name', 'Hybrid AI Scoring Model')))}</span></div>
             <div class="prob-tile"><b>Confidence Level</b><span>{html.escape(str(model.get('confidence_level', 'Moderate')))}</span></div>
             <div class="prob-tile"><b>Risk Confidence</b><span>{model.get('risk_confidence', 0):.0f}%</span></div>
+            <div class="prob-tile"><b>Model Agreement</b><span>{model.get('model_agreement', 0):.0f}%</span></div>
         </div>
         <div class="insight-card">
             <b>Model Logic</b>
@@ -477,34 +554,80 @@ def probability_summary(model):
         """,
         unsafe_allow_html=True,
     )
-
-
-def candlestick_chart(df, title="Price Chart", support=None, resistance=None):
-    fig = go.Figure(
-        data=[
-            go.Candlestick(
-                x=df.index,
-                open=df["Open"],
-                high=df["High"],
-                low=df["Low"],
-                close=df["Close"],
-                name="Price",
-                increasing_line_color=GREEN,
-                decreasing_line_color=RED,
-                increasing_fillcolor="rgba(23,230,165,.72)",
-                decreasing_fillcolor="rgba(255,94,122,.72)",
-            )
+    compared = model.get("models_compared") or []
+    if compared:
+        rows = [
+            {
+                "Model": item.get("name"),
+                "Probability": item.get("probability"),
+                "Uncertainty": item.get("uncertainty"),
+                "Confidence": item.get("confidence_level"),
+                "Why It Fit": item.get("fit_reason"),
+            }
+            for item in compared
         ]
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+        csv_download(rows, "quantara_probability_model_comparison.csv", key="probability_models_csv")
+
+
+def candlestick_chart(df, title="Price Chart", support=None, resistance=None, show_volume=True, show_ma=True, show_rsi=False):
+    from plotly.subplots import make_subplots
+
+    if df is None or df.empty:
+        st.info("Chart data is temporarily unavailable.")
+        return
+    frame = df.tail(260).copy()
+    rows = 3 if show_rsi else 2 if show_volume else 1
+    heights = [0.68, 0.18, 0.14] if show_rsi and show_volume else [0.78, 0.22] if show_volume else [1]
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.035, row_heights=heights)
+    fig.add_trace(
+        go.Candlestick(
+            x=frame.index,
+            open=frame["Open"],
+            high=frame["High"],
+            low=frame["Low"],
+            close=frame["Close"],
+            name="Price",
+            increasing_line_color=GREEN,
+            decreasing_line_color=RED,
+            increasing_fillcolor="rgba(23,230,165,.62)",
+            decreasing_fillcolor="rgba(255,94,122,.62)",
+        ),
+        row=1,
+        col=1,
     )
+    if show_ma:
+        for window, color in [(20, CYAN), (50, YELLOW)]:
+            if len(frame) >= window:
+                fig.add_trace(
+                    go.Scatter(x=frame.index, y=frame["Close"].rolling(window).mean(), name=f"MA{window}", mode="lines", line=dict(color=color, width=1.6)),
+                    row=1,
+                    col=1,
+                )
 
     if support:
-        fig.add_hline(y=support, line_dash="dot", line_color=GREEN, annotation_text="Support")
+        fig.add_hline(y=support, line_dash="dot", line_color=GREEN, annotation_text="Support", row=1, col=1)
     if resistance:
-        fig.add_hline(y=resistance, line_dash="dot", line_color=RED, annotation_text="Resistance")
+        fig.add_hline(y=resistance, line_dash="dot", line_color=RED, annotation_text="Resistance", row=1, col=1)
+
+    next_row = 2
+    if show_volume and "Volume" in frame.columns:
+        colors = [GREEN if close >= open_ else RED for close, open_ in zip(frame["Close"], frame["Open"])]
+        fig.add_trace(go.Bar(x=frame.index, y=frame["Volume"], name="Volume", marker_color=colors, opacity=0.45), row=next_row, col=1)
+        next_row += 1
+    if show_rsi:
+        delta = frame["Close"].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = -delta.clip(upper=0).rolling(14).mean()
+        rsi = 100 - (100 / (1 + gain / loss.replace(0, pd.NA)))
+        fig.add_trace(go.Scatter(x=frame.index, y=rsi, name="RSI", mode="lines", line=dict(color=BLUE, width=1.8)), row=next_row, col=1)
+        fig.add_hline(y=70, line_dash="dot", line_color=RED, row=next_row, col=1)
+        fig.add_hline(y=30, line_dash="dot", line_color=GREEN, row=next_row, col=1)
 
     fig.update_layout(xaxis_rangeslider_visible=False)
-    apply_chart_theme(fig, height=540, title=title)
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(hovermode="x unified", dragmode="pan")
+    apply_chart_theme(fig, height=640 if rows > 1 else 520, title=title)
+    st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False, "scrollZoom": True, "modeBarButtonsToRemove": ["lasso2d", "select2d"]})
 
 
 def equity_curve_chart(equity_curve):
@@ -553,6 +676,11 @@ def basket_cards(positions):
     cards = []
     for item in positions:
         allocation_pct = float(item.get("allocation_pct", 0) or 0)
+        currency = item.get("currency_symbol", "Rs. ")
+        holding = item.get("holding_period") or item.get("horizon") or "Review periodically"
+        rationale = item.get("reason") or item.get("investment_thesis") or "Shortlisted by the Quantara scoring pipeline."
+        stop_loss = item.get("stop_loss")
+        stop_loss_text = f"{currency}{stop_loss}" if isinstance(stop_loss, (int, float)) else html.escape(str(stop_loss))
         cards.append(
             f"""
         <div class="stock-card">
@@ -561,18 +689,18 @@ def basket_cards(positions):
                 <div class="pill pill-buy">BUY</div>
             </div>
             <div class="stock-meta">
+                <div><b>Entry</b>{currency}{item.get('entry')}</div>
+                <div><b>Target</b>{currency}{item.get('target')}</div>
+                <div><b>Stoploss</b>{stop_loss_text}</div>
+                <div><b>Expected Return</b>{item.get('expected_return_pct')}%</div>
                 <div><b>Confidence</b>{item.get('confidence')}%</div>
-                <div><b>Sector</b>{html.escape(str(item.get('sector', 'Unknown')))}</div>
-                <div><b>Risk</b>{html.escape(str(item.get('risk_level', 'Unknown')))}</div>
-                <div><b>Momentum</b>{html.escape(str(item.get('momentum', 'Neutral')))}</div>
-                <div><b>Qty</b>{item.get('qty')}</div>
-                <div><b>Allocation</b>Rs. {item.get('allocation')} ({allocation_pct:.1f}%)</div>
+                <div><b>Holding Period</b>{html.escape(str(holding))}</div>
             </div>
             <div class="allocation-bar"><span style="width:{max(0, min(100, allocation_pct))}%"></span></div>
             <div class="card-details">
-                Entry Rs. {item.get('entry')} | SL Rs. {item.get('stop_loss')} | Target Rs. {item.get('target')} | R:R {item.get('risk_reward')}
+                {html.escape(str(item.get('momentum', 'Neutral')))} | {html.escape(str(item.get('risk_level', 'Unknown')))} risk | {html.escape(str(item.get('sector', 'Unknown')))} | allocation {currency}{item.get('allocation')} ({allocation_pct:.1f}%)
             </div>
-            <div class="reason">{html.escape(str(item.get('reason', '')))}</div>
+            <div class="reason">{html.escape(str(rationale))}</div>
         </div>
         """
         )

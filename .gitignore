@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.log
+.quantara/error_log.txt
+.quantara/evaluation/
+.quantara/market_cache/
+.quantara/persistent_cache/
+.quantara/resolved_symbols.json
+.continue/
+.vscode/

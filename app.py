@@ -4,11 +4,12 @@ from pathlib import Path
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import streamlit.components.v1 as components
 
+import config
 from engines.backtester import compare_strategies, run_backtest
-from engines.basket_engine import build_stock_basket
-from engines.data_service import SECTOR_OPTIONS, get_market_universe, get_price_history
+from engines.basket_engine import build_investing_basket, build_stock_basket, prescreen_market_candidates
+from engines.data_service import SECTOR_OPTIONS, get_market_universe, get_price_history, resolve_ticker, safe_info, search_universe
+from engines.formatting import format_currency, format_metric_value
 from engines.news_engine import aggregate_news_sentiment, get_news
 from engines.stock_engine import analyze_stock
 from portfolio_analyzer import analyze_uploaded_portfolio
@@ -33,7 +34,9 @@ from ui_components import (
     probability_summary,
     scan_skeleton,
     compact_alert,
+    csv_download,
     section_help,
+    stock_header_card,
 )
 
 
@@ -46,6 +49,10 @@ WATCHLIST_FILE = STATE_DIR / "watchlist.json"
 
 
 st.set_page_config(page_title=APP_NAME, page_icon=str(APP_DIR / "assets" / "favicon.svg"), layout="wide")
+try:
+    st.set_option("client.showErrorDetails", False)
+except Exception:
+    pass
 inject_theme()
 
 
@@ -64,6 +71,11 @@ def cached_market_universe():
     return get_market_universe()
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def cached_resolve_symbol(query):
+    return resolve_ticker(query, cached_market_universe())
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_price_history(ticker):
     return get_price_history(ticker, period="5d")
@@ -74,52 +86,91 @@ def cached_history(ticker, period="1y"):
     return get_price_history(ticker, period=period)
 
 
-def tradingview_symbol(ticker):
-    clean_ticker = ticker.upper().strip()
-    if clean_ticker.endswith(".NS"):
-        return f"NSE:{clean_ticker[:-3]}"
-    if clean_ticker.endswith(".BO"):
-        return f"BSE:{clean_ticker[:-3]}"
-    return clean_ticker
+def _numeric_series(value):
+    if value is None:
+        return pd.Series(dtype=float)
+    if isinstance(value, pd.DataFrame):
+        if value.empty:
+            return pd.Series(dtype=float)
+        value = value.iloc[:, 0]
+    series = pd.to_numeric(pd.Series(value).squeeze(), errors="coerce")
+    if not isinstance(series, pd.Series):
+        series = pd.Series([series])
+    return series.dropna().astype(float)
 
 
-def show_tradingview_chart(ticker):
-    symbol = tradingview_symbol(ticker)
-    html = f"""
-    <style>
-      html, body {{ margin:0; padding:0; width:100%; height:100%; background:#071525; color:#E7F8FF; }}
-      .tv-wrap {{
-        width: 100%;
-        height: 760px;
-        min-height: 560px;
-        border: 1px solid rgba(98,245,255,.16);
-        border-radius: 8px;
-        overflow: hidden;
-        background: #071525;
-      }}
-      #tradingview_chart {{ width:100%; height:100%; }}
-      @media (max-width: 900px) {{ .tv-wrap {{ height: 620px; min-height: 420px; }} }}
-    </style>
-    <div class="tv-wrap">
-      <div id="tradingview_chart"></div>
-    </div>
-    <script src="https://s3.tradingview.com/tv.js"></script>
-    <script>
-    new TradingView.widget({{
-        "autosize": true,
-        "symbol": "{symbol}",
-        "interval": "D",
-        "timezone": "Asia/Kolkata",
-        "theme": "dark",
-        "style": "1",
-        "locale": "en",
-        "hide_side_toolbar": false,
-        "allow_symbol_change": true,
-        "container_id": "tradingview_chart"
-    }});
-    </script>
-    """
-    components.html(html, height=780)
+def _close_series(history):
+    if history is None or history.empty or "Close" not in history:
+        return pd.Series(dtype=float)
+    return _numeric_series(history["Close"])
+
+
+def _clean_stock_label(value):
+    return str(value or "").replace(".NS", "").replace(".BO", "")
+
+
+def _public_universe_frame(rows, limit=500):
+    public_rows = []
+    for row in rows[:limit]:
+        public_rows.append({
+            "Company": row.get("display_name") or row.get("name") or _clean_stock_label(row.get("symbol") or row.get("ticker")),
+            "Symbol": _clean_stock_label(row.get("symbol") or row.get("ticker")),
+            "Sector": row.get("sector", "Other"),
+            "Segment": row.get("segment", "Equity"),
+        })
+    return pd.DataFrame(public_rows)
+
+
+def _render_backtest_summary(bt, comparison=None):
+    summary = bt.get("summary", {})
+    total_return = float(summary.get("total_return", summary.get("roi", 0)) or 0)
+    cagr = float(summary.get("cagr", 0) or 0)
+    win_rate = float(summary.get("win_rate", 0) or 0)
+    drawdown = float(summary.get("max_drawdown", 0) or 0)
+    sharpe = float(summary.get("sharpe", 0) or 0)
+    profit_factor = float(summary.get("profit_factor", 0) or 0)
+    confidence = float(summary.get("strategy_confidence", 0) or 0)
+
+    if total_return > 0 and sharpe >= 0.8 and drawdown <= 18:
+        interpretation = "Strategy quality is constructive: returns are positive and drawdown is controlled."
+    elif total_return > 0:
+        interpretation = "Strategy produced positive returns, but risk-adjusted quality needs monitoring."
+    elif summary.get("total_trades", 0):
+        interpretation = "Strategy generated trades but did not produce a positive net edge in this period."
+    else:
+        interpretation = "No trades qualified under the selected rules; this can be prudent during weak or noisy regimes."
+
+    benchmark_note = "Benchmark comparison unavailable for this run."
+    if comparison is not None and not comparison.empty and "total_return" in comparison.columns:
+        try:
+            best = comparison.sort_values("total_return", ascending=False).iloc[0]
+            benchmark_note = f"Best tested risk profile was {best.get('strategy')} with {float(best.get('total_return', 0)):.2f}% total return."
+        except Exception:
+            pass
+
+    strengths = []
+    weaknesses = []
+    if win_rate >= 52:
+        strengths.append(f"Win rate is healthy at {win_rate:.1f}%.")
+    else:
+        weaknesses.append(f"Win rate is modest at {win_rate:.1f}%.")
+    if drawdown <= 15:
+        strengths.append(f"Drawdown stayed controlled at {drawdown:.1f}%.")
+    else:
+        weaknesses.append(f"Drawdown is elevated at {drawdown:.1f}%.")
+    if profit_factor >= 1.2:
+        strengths.append(f"Profit factor is acceptable at {profit_factor:.2f}.")
+    else:
+        weaknesses.append(f"Profit factor is weak at {profit_factor:.2f}.")
+
+    insight_card("Backtesting Summary", [
+        f"Total return {total_return:.2f}%, CAGR {cagr:.2f}%, win rate {win_rate:.2f}%, max drawdown {drawdown:.2f}%.",
+        f"Risk-adjusted read: Sharpe {sharpe:.2f}, profit factor {profit_factor:.2f}, strategy confidence {confidence:.0f}/100.",
+        interpretation,
+        benchmark_note,
+        "Strengths: " + (" ".join(strengths) if strengths else "No dominant strength yet."),
+        "Weaknesses: " + (" ".join(weaknesses) if weaknesses else "No major weakness stood out in this run."),
+    ])
 
 
 def read_notes():
@@ -148,7 +199,11 @@ def write_watchlist(items):
 def render_sidebar_tools():
     brand_header()
     st.sidebar.markdown("<div class='q-section-title'>Workspace</div>", unsafe_allow_html=True)
-    mode = st.sidebar.radio("Workspace mode", ["Stock Terminal", "Portfolio", "Stock Basket", "Stock Comparison"], label_visibility="collapsed")
+    mode = st.sidebar.radio(
+        "Workspace mode",
+        ["Stock Terminal", "Portfolio", "Swing Basket", "Long Term Investing", "Stock Comparison"],
+        label_visibility="collapsed",
+    )
 
     if "trading_notes" not in st.session_state:
         st.session_state["trading_notes"] = read_notes()
@@ -166,10 +221,10 @@ def render_sidebar_tools():
     )
 
     st.sidebar.markdown("<div class='q-section-title'>Watchlist</div>", unsafe_allow_html=True)
-    new_symbol = st.sidebar.text_input("Add symbol", placeholder="E.g. HDFCBANK.NS", key="watch_add")
+    new_symbol = st.sidebar.text_input("Add symbol", placeholder="E.g. HDFC Bank", key="watch_add")
     add_col, clear_col = st.sidebar.columns([1, 1])
     if add_col.button("Add", use_container_width=True) and new_symbol:
-        symbol = new_symbol.upper().strip()
+        symbol = cached_resolve_symbol(new_symbol)["ticker"]
         if symbol and symbol not in st.session_state["watchlist"]:
             st.session_state["watchlist"].append(symbol)
             write_watchlist(st.session_state["watchlist"])
@@ -178,8 +233,8 @@ def render_sidebar_tools():
         write_watchlist([])
 
     for symbol in st.session_state["watchlist"][:12]:
+        display = _clean_stock_label(symbol)
         try:
-            display = symbol.replace(".NS", "").replace(".BO", "")
             hist = cached_price_history(symbol)["Close"].dropna()
             price = float(hist.iloc[-1])
             prev = float(hist.iloc[-2]) if len(hist) > 1 else price
@@ -197,7 +252,7 @@ def render_sidebar_tools():
             )
             st.sidebar.caption("Tracking | signal opens in terminal")
         except Exception:
-            st.sidebar.caption(f"{symbol} | data unavailable")
+            st.sidebar.caption(f"{display} | data unavailable")
         remove_key = f"remove_{symbol}"
         if st.sidebar.button("Remove", key=remove_key, use_container_width=True):
             st.session_state["watchlist"] = [item for item in st.session_state["watchlist"] if item != symbol]
@@ -207,8 +262,25 @@ def render_sidebar_tools():
 
 
 def render_stock_terminal():
-    ticker = st.sidebar.text_input("Ticker", "TCS.NS").upper().strip()
-    chart_mode = st.sidebar.radio("Chart Source", ["Plotly Native", "TradingView"], horizontal=False)
+    st.title(APP_NAME)
+    st.caption("Market decision intelligence for stocks, portfolios, baskets, backtests, and funds")
+
+    universe = cached_market_universe()
+    search_query = st.text_input(
+        "Search stock",
+        value=st.session_state.get("active_stock_query", "Tata Consultancy Services"),
+        placeholder="Search company or ticker, e.g. Tata Motors, Reliance, Apple",
+        key="stock_search_top",
+    )
+    matches = search_universe(search_query, universe, limit=8) if search_query else []
+    if matches:
+        labels = [row.get("display_name") or row.get("name") or row.get("symbol") for row in matches]
+        selected_label = st.selectbox("Best matches", labels, label_visibility="collapsed")
+        selected_row = matches[labels.index(selected_label)]
+    else:
+        selected_row = cached_resolve_symbol(search_query or "TCS")
+    ticker = selected_row["ticker"]
+    st.session_state["active_stock_query"] = selected_row.get("display_name") or search_query
 
     try:
         with st.spinner("Running AI quant analysis..."):
@@ -225,18 +297,22 @@ def render_stock_terminal():
             st.rerun()
         return
 
-    st.title(APP_NAME)
-    st.caption("AI-powered swing trading ecosystem for institutional-style swing trading decisions")
     section_help("Stock Terminal", "Runs full AI analysis for one ticker: price structure, fundamentals, technicals, probability, risk plan, backtesting, and news sentiment. This is intentionally heavier than basket scanning.")
+    result["metadata"] = {**result.get("metadata", {}), **selected_row, "ticker": ticker}
 
-    k1, k2, k3, k4, k5 = st.columns([1, 1, 1, 1, 1])
-    k1.metric("Price", f"Rs. {result['price']:.2f}")
-    k2.metric("Decision", result["decision"])
+    def money(value, compact=False):
+        return format_currency(value, ticker=ticker, exchange=result.get("exchange"), currency=result.get("currency"), compact=compact)
+
+    stock_header_card(result["metadata"], result, money)
+
+    quantara_score = result.get("quantara_score", result.get("ai_score", 0))
+    k1, k2, k3, k4 = st.columns([1, 1, 1, 1])
+    k1.metric("Price", money(result["price"]), f"{result.get('day_change_pct', 0):+.2f}%")
+    k2.metric("Status", result["decision"])
     with k3:
-        confidence_ring(result["trade_confidence"])
+        confidence_ring(quantara_score)
     k4.metric("Risk", result["risk_level"])
-    k5.metric("Holding", result["holding_period"])
-    decision_badge(result["decision"], result["trade_confidence"])
+    decision_badge(result["decision"], quantara_score)
 
     terminal_view = st.radio("Terminal View", [
         "Dashboard",
@@ -254,21 +330,44 @@ def render_stock_terminal():
         c1.metric("Trend", result["trend"])
         c2.metric("Expected 30d", f"{result['expected_return_pct']:.2f}%")
         c3.metric("Risk-Reward", f"{result['risk_reward']:.2f}")
-        c4.metric("Uncertainty", f"{result['uncertainty']}%")
+        c4.metric("Quantara Score", f"{quantara_score:.0f}/100")
+
+        with st.expander("Score details", expanded=False):
+            st.dataframe([{
+                "Quantara Score": round(quantara_score, 2),
+                "Technical": result.get("technical_score"),
+                "Fundamentals": result.get("fundamental_score"),
+                "Momentum": result.get("momentum_score"),
+                "Risk": result.get("risk_score"),
+                "Sentiment": result.get("sentiment_score"),
+                "Signal Confidence": result.get("trade_confidence"),
+                "Decision Quality": result.get("decision_score"),
+                "Recommendation Gate": "Master score maps 80+ Strong Buy, 65-79 Buy, 50-64 Hold, below 50 Avoid, with ATR risk-reward protection.",
+            }], use_container_width=True, hide_index=True)
 
         insight_card("AI Trade Summary", result["probability_reasons"])
         insight_card("Decision Logic", result["decision_reasons"])
+        insight_card("User Trust Layer", result.get("trust_explanation", []))
 
     elif terminal_view == "Chart":
-        section_help("Chart", "Displays either Quantara's dark Plotly candlestick view or an embedded TradingView chart.")
-        if chart_mode == "TradingView":
-            show_tradingview_chart(ticker)
+        section_help("Chart", "Professional Plotly chart with optional volume, moving averages, and RSI overlays.")
+        chart_cols = st.columns([1, 1, 1, 1])
+        chart_period = chart_cols[0].selectbox("Timeframe", ["6mo", "1y", "2y", "5y"], index=1)
+        show_volume = chart_cols[1].checkbox("Volume", value=True)
+        show_ma = chart_cols[2].checkbox("MA 20/50", value=True)
+        show_rsi = chart_cols[3].checkbox("RSI", value=False)
+        chart_history = cached_history(ticker, chart_period)
+        if chart_history.empty:
+            compact_alert("Chart data unavailable", "Cached chart data is unavailable right now. Please retry after the market data provider cools down.", level="info")
         else:
             candlestick_chart(
-                result["history"],
-                title=f"{ticker} Price Structure",
+                chart_history,
+                title=f"{result.get('company_name', 'Stock')} Price Structure",
                 support=result["support"],
-                resistance=result["resistance"]
+                resistance=result["resistance"],
+                show_volume=show_volume,
+                show_ma=show_ma,
+                show_rsi=show_rsi,
             )
 
     elif terminal_view == "Fundamentals":
@@ -280,13 +379,23 @@ def render_stock_terminal():
         f3.metric("Data Quality", fundamentals["data_quality"])
 
         metrics = fundamentals["metrics"]
-        metric_rows = [{"Metric": key.replace("_", " ").title(), "Value": value} for key, value in metrics.items()]
+        metric_rows = [{"Metric": key.replace("_", " ").title(), "Value": format_metric_value(key, value, ticker=ticker, exchange=result.get("exchange"), currency=result.get("currency"))} for key, value in metrics.items()]
         st.dataframe(metric_rows, use_container_width=True)
+        csv_download(metric_rows, f"quantara_{ticker}_fundamentals.csv", key=f"{ticker}_fundamentals_csv")
+        balance_sheet = fundamentals.get("balance_sheet_summary", {})
+        if balance_sheet:
+            with st.expander("Balance sheet summary", expanded=False):
+                st.dataframe(
+                    [{"Metric": key.replace("_", " ").title(), "Value": format_metric_value(key, value, ticker=ticker, exchange=result.get("exchange"), currency=result.get("currency"))} for key, value in balance_sheet.items()],
+                    use_container_width=True,
+                    hide_index=True,
+                )
         fundamentals_chart(fundamentals["trend_data"])
         insight_card("Fundamental Explanation", fundamentals["insights"])
 
     elif terminal_view == "Technical & Patterns":
         section_help("Technical & Patterns", "Shows RSI, MACD, ATR, volume strength, support/resistance, breakout state, and detected price patterns.")
+        insight_card("AI Technical Summary", result.get("technical_summary", []))
         t1, t2, t3, t4 = st.columns(4)
         t1.metric("RSI", f"{result['rsi']:.2f}")
         t2.metric("MACD", f"{result['macd']:.2f}")
@@ -302,16 +411,25 @@ def render_stock_terminal():
             "Structure": result["structure"],
             "Consolidation": result["consolidation"]
         }], use_container_width=True)
+        csv_download([{
+            "Support": round(result["support"], 2),
+            "Resistance": round(result["resistance"], 2),
+            "Zone": result["zone"],
+            "Breakout": result["breakout"],
+            "Structure": result["structure"],
+            "Consolidation": result["consolidation"]
+        }], f"quantara_{ticker}_price_structure.csv", key=f"{ticker}_structure_csv")
 
         st.write("### Detected Patterns")
         st.dataframe(result["patterns"], use_container_width=True)
+        csv_download(result["patterns"], f"quantara_{ticker}_patterns.csv", key=f"{ticker}_patterns_csv")
 
     elif terminal_view == "Probability & Risk":
         section_help("Probability & Risk", "Combines forecast, trend, volume, structure, patterns, fundamentals, sentiment, ATR risk, stop loss, and target quality.")
         r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Entry", f"Rs. {result['price']:.2f}")
-        r2.metric("Stop Loss", f"Rs. {result['stop_loss']:.2f}")
-        r3.metric("Target", f"Rs. {result['target']:.2f}")
+        r1.metric("Entry", money(result["price"]))
+        r2.metric("Stop Loss", money(result["stop_loss"]))
+        r3.metric("Target", money(result["target"]))
         r4.metric("ATR Volatility", f"{result['atr_pct']:.2f}%")
         probability_summary(result.get("probability_model", {}))
         insight_card("Probability Model", result["probability_reasons"])
@@ -347,22 +465,46 @@ def render_stock_terminal():
             s1, s2, s3, s4, s5, s6 = st.columns(6)
             s1.metric("Trades", summary["total_trades"])
             s2.metric("Win Rate", f"{summary['win_rate']}%")
-            s3.metric("ROI", f"{summary['roi']}%")
+            s3.metric("Total Return", f"{summary.get('total_return', summary['roi'])}%")
             s4.metric("Drawdown", f"{summary['max_drawdown']}%")
             s5.metric("Sharpe", summary["sharpe"])
-            s6.metric("Profit Factor", summary["profit_factor"])
+            s6.metric("CAGR", f"{summary.get('cagr', 0)}%")
+            x1, x2, x3 = st.columns(3)
+            x1.metric("Profit Factor", summary["profit_factor"])
+            x2.metric("Strategy Confidence", f"{summary.get('strategy_confidence', 0)}%")
+            x3.metric("Ending Capital", money(summary.get("ending_capital", capital)))
+            _render_backtest_summary(bt, st.session_state.get("last_backtest_compare"))
             equity_curve_chart(bt["equity_curve"])
+            csv_download(bt["equity_curve"], f"quantara_{ticker}_equity_curve.csv", key=f"{ticker}_equity_csv")
+
+            trade_extremes = []
+            if summary.get("best_trade"):
+                trade_extremes.append({"Label": "Best Trade", **summary["best_trade"]})
+            if summary.get("worst_trade"):
+                trade_extremes.append({"Label": "Worst Trade", **summary["worst_trade"]})
+            if trade_extremes:
+                st.write("### Best / Worst Trade")
+                st.dataframe(trade_extremes, use_container_width=True, hide_index=True)
+                csv_download(trade_extremes, f"quantara_{ticker}_best_worst_trades.csv", key=f"{ticker}_best_worst_csv")
 
             if bt["trades"]:
                 st.write("### Trades")
                 st.dataframe(bt["trades"], use_container_width=True, hide_index=True)
+                csv_download(bt["trades"], f"quantara_{ticker}_backtest_trades.csv", key=f"{ticker}_trades_csv")
             else:
                 st.info("No trade rows to display. Adjust risk level or holding period to test a broader setup.")
+
+            monthly = bt.get("monthly_performance", [])
+            if monthly:
+                st.write("### Monthly Performance")
+                st.dataframe(monthly, use_container_width=True, hide_index=True)
+                csv_download(monthly, f"quantara_{ticker}_monthly_performance.csv", key=f"{ticker}_monthly_csv")
 
             st.write("### Strategy Comparison")
             comparison = st.session_state.get("last_backtest_compare")
             if comparison is not None and not comparison.empty:
                 st.dataframe(comparison, use_container_width=True, hide_index=True)
+                csv_download(comparison, f"quantara_{ticker}_strategy_comparison.csv", key=f"{ticker}_strategy_csv")
             else:
                 st.info("Strategy comparison will appear after a successful run.")
         else:
@@ -384,8 +526,8 @@ def render_stock_terminal():
 
 def render_portfolio():
     st.title("Portfolio Analyzer & Rebalancing")
-    section_help("Portfolio Analyzer", "Upload CSV columns Ticker, Quantity, and Buy_Price. Quantara computes health, risk, sector allocation, weak holdings, replacement candidates, and index-relative performance.")
-    file = st.file_uploader("Upload CSV with Ticker, Quantity, Buy_Price", type=["csv"])
+    section_help("Portfolio Analyzer", "Upload CSV with Stock Name or Ticker, Buy Price, and Quantity. Quantara resolves tickers, identifies the market, and computes health, risk, sector allocation, replacement candidates, and benchmark comparison.")
+    file = st.file_uploader("Upload CSV with Stock Name/Ticker, Buy Price, Quantity", type=["csv"])
     if file:
         try:
             df = pd.read_csv(file)
@@ -400,17 +542,17 @@ def render_portfolio():
 
 
 def render_basket():
-    st.title("Smart Stock Basket")
+    st.title("Swing Basket")
     st.caption("Auto-scanning the listed universe for the strongest BUY opportunities.")
     section_help("Basket Scanner", "Uses a fast batched OHLCV pre-scan for thousands of symbols, then ranks technically qualified BUY setups. It avoids full per-stock fundamentals during the scan to keep the app responsive.")
     universe_rows = cached_market_universe()
-    st.caption(f"Combined NSE+BSE stock universe: {len(universe_rows)} validated listings")
+    st.caption(f"Auto-resolved stock universe: {len(universe_rows)} validated listings")
 
     selected_sectors = st.multiselect(
         "Sector Filter",
         SECTOR_OPTIONS + ["Other"],
         placeholder="Scan all sectors",
-        help="Select one or more sectors to restrict the scan. Leave empty to scan the selected exchange universe.",
+        help="Select one or more sectors to restrict the scan. Leave empty to scan the full auto-resolved universe.",
     )
     if selected_sectors:
         universe_rows = [row for row in universe_rows if row.get("sector", "Other") in selected_sectors or row.get("segment") in selected_sectors]
@@ -429,11 +571,17 @@ def render_basket():
     max_positions = controls[1].slider("Max Positions", 2, 8, 4)
     risk_pct = controls[2].slider("Risk per Trade %", 0.5, 3.0, 1.5, 0.25)
     dynamic_scan_max = max(20, len(filtered_universe))
-    scan_limit = controls[3].slider("Scan Limit", 20, dynamic_scan_max, min(60, dynamic_scan_max), 10)
+    scan_limit = controls[3].slider(
+        "Scan Limit",
+        20,
+        dynamic_scan_max,
+        dynamic_scan_max,
+        25
+    )
     candidates = filtered_universe[:scan_limit]
 
     with st.expander(f"Universe preview ({len(filtered_universe)} symbols available)", expanded=False):
-        st.dataframe(pd.DataFrame(filtered_universe[:500]), use_container_width=True, hide_index=True)
+        st.dataframe(_public_universe_frame(filtered_universe), use_container_width=True, hide_index=True)
 
     sort_by = st.selectbox("Sort BUY opportunities by", ["confidence", "expected_return_pct", "risk_reward", "allocation"], index=0)
     rescan = st.button("Run / Refresh BUY Scan")
@@ -456,20 +604,37 @@ def render_basket():
 
     def render_basket_result(basket, is_partial=False):
         positions = sorted(basket["positions"], key=lambda item: item.get(sort_by, 0), reverse=True)
+        table_rows = [{
+            "Stock": item.get("display_name") or item.get("symbol"),
+            "Current Price": item.get("current_price") or item.get("entry"),
+            "Entry": item.get("entry"),
+            "Target": item.get("target"),
+            "Stop Loss": item.get("stop_loss"),
+            "Confidence": item.get("confidence"),
+            "Risk/Reward": item.get("risk_reward"),
+            "Probability Model": item.get("probability_model", "Fast Momentum Risk Model"),
+            "Quantara Score": item.get("quantara_score", item.get("ai_score")),
+            "Risk": item.get("risk_level"),
+            "Allocation": item.get("allocation"),
+            "Quantity": item.get("qty"),
+            "Sector": item.get("sector"),
+        } for item in positions]
         with metrics_slot.container():
-            b1, b2, b3, b4 = st.columns(4)
+            b1, b2, b3, b4, b5 = st.columns(5)
             b1.metric("BUY Score", f"{basket['basket_score']}%")
             b2.metric("Used Capital", f"Rs. {basket['used_capital']:.2f}")
             b3.metric("Cash Remaining", f"Rs. {basket['cash_remaining']:.2f}")
-            b4.metric("Qualified BUYs", basket["qualified"])
+            b4.metric("Accepted", basket["qualified"])
+            b5.metric("Rejected", basket.get("rejected", max(0, basket.get("scanned", 0) - basket.get("qualified", 0))))
             if basket.get("elapsed") is not None:
                 st.caption(f"Scanned {basket['scanned']}/{basket.get('universe_size', basket['scanned'])} in {basket['elapsed']}s")
         with cards_slot.container():
             basket_cards(positions)
         with table_slot.container():
-            if positions:
+            if positions and not is_partial:
                 with st.expander("Detailed allocation table", expanded=False):
-                    st.dataframe(positions, use_container_width=True, hide_index=True)
+                    st.dataframe(table_rows, use_container_width=True, hide_index=True)
+                    csv_download(table_rows, "quantara_swing_basket.csv", key="swing_basket_csv")
             elif not is_partial:
                 compact_alert("No BUY setups found", "Increase scan limit, choose fewer sector filters, or retry later if data was throttled.", level="info")
         if not is_partial:
@@ -485,20 +650,34 @@ def render_basket():
         progress_bar = st.progress(0, text="Starting scan...")
 
         def on_progress(partial_basket, completed, total):
-            progress_bar.progress(completed / total, text=f"Scanned {completed}/{total} symbols")
+            progress_bar.progress(completed / total, text=f"Analyzed shortlist {completed}/{total}")
             if partial_basket["positions"]:
                 render_basket_result(partial_basket, is_partial=True)
 
+        def on_prescreen_progress(completed, total):
+            progress_bar.progress(completed / max(total, 1), text=f"Prescreened {completed}/{total} symbols")
+
+        shortlisted = prescreen_market_candidates(
+            candidates,
+            keep_ratio=config.PRESCREEN_PERCENT,
+            period="6mo",
+            chunk_size=config.SCAN_CHUNK,
+            max_workers=config.BASKET_WORKERS,
+            progress_callback=on_prescreen_progress,
+        )
+
         basket = build_stock_basket(
             capital,
-            candidates,
+            shortlisted,
             max_positions,
             risk_pct,
-            scan_limit,
+            min(scan_limit, len(shortlisted)) if shortlisted else scan_limit,
             progress_callback=on_progress,
-            max_workers=4,
-            chunk_size=80,
+            max_workers=config.BASKET_WORKERS,
+            chunk_size=config.SCAN_CHUNK,
+            universe_size=len(candidates),
         )
+
         progress_bar.empty()
         progress_slot.empty()
         st.session_state["last_basket"] = basket
@@ -511,6 +690,108 @@ def render_basket():
         compact_alert("Ready to scan", "Choose your universe, optional sector filters, and click Run / Refresh BUY Scan. Scans no longer run automatically on every tab switch.", level="info")
 
 
+def render_investing_basket():
+    if not config.ENABLE_LONGTERM_SCAN:
+        compact_alert("Long-term scan disabled", "This module is currently disabled by feature flag while the platform keeps other workflows responsive.", level="info")
+        return
+    st.title("Long Term Investing")
+    st.caption("Builds a research-first basket for 1 year, 3 year, and longer-term compounding workflows.")
+    universe_rows = cached_market_universe()
+    selected_sectors = st.multiselect("Sector Filter", SECTOR_OPTIONS + ["Other"], placeholder="All sectors", key="investing_sector")
+    if selected_sectors:
+        universe_rows = [row for row in universe_rows if row.get("sector", "Other") in selected_sectors]
+    search = st.text_input("Search / Filter Universe", placeholder="Type company or sector text", key="investing_search")
+    filtered = [
+        row for row in universe_rows
+        if not search or search.upper() in " ".join(str(row.get(k, "")) for k in ["ticker", "symbol", "name", "display_name", "sector"]).upper()
+    ]
+    controls = st.columns([1, 1, 1, 1])
+    capital = controls[0].number_input("Investment Amount", min_value=5000, value=100000, step=5000, key="investing_capital")
+    horizon = controls[1].selectbox("Horizon", ["1 Year", "3 Years", "Long Term"], index=1)
+    max_positions = controls[2].slider("Max Holdings", 3, 12, 6)
+    scan_limit = controls[3].slider(
+        "Scan Limit",
+        20,
+        max(20, len(filtered)),
+        max(20, len(filtered)),
+        20,
+        key="investing_scan_limit"
+    )
+    with st.expander(f"Universe preview ({len(filtered)} symbols available)", expanded=False):
+        preview = _public_universe_frame(filtered)
+        st.dataframe(preview, use_container_width=True, hide_index=True)
+        csv_download(preview, "quantara_investing_universe_preview.csv", key="investing_universe_csv")
+    if st.button("Build Investing Basket"):
+        progress = st.progress(0, text="Starting long-term quality scan...")
+        live_slot = st.empty()
+
+        def on_investing_progress(partial_basket, completed, total):
+            progress.progress(completed / max(total, 1), text=f"Analyzed {completed}/{total} candidates")
+            live_positions = partial_basket.get("positions", [])
+            if live_positions:
+                with live_slot.container():
+                    basket_cards(live_positions[:max_positions])
+
+        with st.spinner("Ranking long-term candidates..."):
+            filtered_candidates = prescreen_market_candidates(
+                filtered[:scan_limit],
+                keep_ratio=config.PRESCREEN_PERCENT,
+                period="6mo",
+                chunk_size=config.SCAN_CHUNK,
+                max_workers=config.BASKET_WORKERS,
+                progress_callback=lambda completed, total: progress.progress(
+                    completed / max(total, 1),
+                    text=f"Prescreened {completed}/{total} symbols",
+                ),
+            )
+
+            st.session_state["last_investing_basket"] = build_investing_basket(
+                capital,
+                filtered_candidates,
+                horizon=horizon,
+                max_positions=max_positions,
+                scan_limit=min(scan_limit, len(filtered_candidates)) if filtered_candidates else scan_limit,
+                progress_callback=on_investing_progress,
+                chunk_size=config.SCAN_CHUNK,
+                universe_size=min(scan_limit, len(filtered)),
+            )
+        progress.empty()
+    basket = st.session_state.get("last_investing_basket")
+    if not basket:
+        compact_alert("Ready to build", "Choose filters and click Build Investing Basket for a long-term shortlist.", level="info")
+        return
+    positions = basket.get("positions", [])
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Investing Score", f"{basket.get('basket_score', 0)}%")
+    b2.metric("Used Capital", format_currency(basket.get("used_capital", 0), ticker="NIFTY.NS"))
+    b3.metric("Cash Remaining", format_currency(basket.get("cash_remaining", 0), ticker="NIFTY.NS"))
+    b4.metric("Candidates", len(positions))
+    if positions:
+        basket_cards(positions)
+        rows = [{
+            "Stock": item.get("display_name"),
+            "Sector": item.get("sector"),
+            "Current Price": item.get("current_price"),
+            "1Y Outlook": item.get("one_year_outlook"),
+            "3Y Outlook": item.get("three_year_outlook"),
+            "5Y Potential": item.get("five_year_potential"),
+            "Estimated CAGR": item.get("estimated_cagr"),
+            "Long-Term Confidence": item.get("long_term_confidence"),
+            "Quantara Score": item.get("quantara_score", item.get("ai_score")),
+            "Risk": item.get("risk_profile"),
+            "Risk Profile": item.get("risk_profile"),
+            "Investment Thesis": item.get("investment_thesis"),
+        } for item in positions]
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+        csv_download(rows, "quantara_long_term_investing_basket.csv", key="investing_basket_csv")
+        sector_rows = pd.DataFrame(rows).groupby("Sector").size().reset_index(name="Holdings").to_dict("records")
+        st.write("### Sector Allocation")
+        st.dataframe(sector_rows, use_container_width=True, hide_index=True)
+        csv_download(sector_rows, "quantara_investing_sector_allocation.csv", key="investing_sector_alloc_csv")
+    else:
+        compact_alert("No long-term candidates", "Try a wider scan or fewer sector filters.", level="info")
+
+
 def _score_comparison(result):
     technical = max(0, min(100, (result["trade_confidence"] * 0.45) + (result["risk_reward"] * 12) + (result["expected_return_pct"] * 2)))
     fundamental = result["fundamentals"].get("score", 0)
@@ -518,7 +799,7 @@ def _score_comparison(result):
     momentum = 75 if result["trend"] == "Uptrend" else 35 if result["trend"] == "Downtrend" else 55
     ai_score = round((technical * 0.45) + (fundamental * 0.35) + (risk * 0.2), 2)
     return {
-        "AI score": ai_score,
+        "Quantara score": result.get("quantara_score", ai_score),
         "Fundamental score": round(fundamental, 2),
         "Technical score": round(technical, 2),
         "Momentum": momentum,
@@ -528,27 +809,30 @@ def _score_comparison(result):
 
 
 def _benchmark_return(symbol):
-    hist = cached_history(symbol, "1y")
-    close = hist["Close"].dropna() if not hist.empty else pd.Series(dtype=float)
-    if len(close) < 2:
+    try:
+        hist = cached_history(symbol, "1y")
+        close = _close_series(hist)
+        if len(close) < 2 or float(close.iloc[0]) == 0:
+            return None
+        return ((float(close.iloc[-1]) / float(close.iloc[0])) - 1) * 100
+    except Exception:
         return None
-    return ((float(close.iloc[-1]) / float(close.iloc[0])) - 1) * 100
 
 
 def _comparison_row(symbol, result, nifty_return, sensex_return):
     scores = _score_comparison(result)
-    history = result["history"]["Close"].dropna()
-    returns = ((float(history.iloc[-1]) / float(history.iloc[0])) - 1) * 100 if len(history) > 1 else 0
+    history = _close_series(result.get("history"))
+    returns = ((float(history.iloc[-1]) / float(history.iloc[0])) - 1) * 100 if len(history) > 1 and float(history.iloc[0]) else 0
     metrics = result["fundamentals"]["metrics"]
-    ma20 = float(history.rolling(20).mean().iloc[-1]) if len(history) >= 20 else None
-    ma50 = float(history.rolling(50).mean().iloc[-1]) if len(history) >= 50 else None
+    ma20 = float(history.rolling(20).mean().iloc[-1]) if len(history) >= 20 and pd.notna(history.rolling(20).mean().iloc[-1]) else None
+    ma50 = float(history.rolling(50).mean().iloc[-1]) if len(history) >= 50 and pd.notna(history.rolling(50).mean().iloc[-1]) else None
     trend_strength = round(abs(float(history.iloc[-1]) - (ma50 or float(history.iloc[-1]))) / float(history.iloc[-1]) * 100, 2) if len(history) else 0
     volume_strength = round(result["volume_ratio"] * 50, 2)
     breakout_probability = max(0, min(100, result["trade_confidence"] + (10 if result["breakout"] == "Bullish breakout" else -10 if result["breakout"] == "Bearish breakdown" else 0)))
     risk_score = max(0, min(100, 100 - result["risk_pct"] * 8 - result["atr_pct"] * 4))
-    suitability = round((scores["AI score"] * 0.5) + (scores["Technical score"] * 0.25) + (risk_score * 0.25), 2)
+    suitability = round((scores["Quantara score"] * 0.5) + (scores["Technical score"] * 0.25) + (risk_score * 0.25), 2)
     return {
-        "Ticker": symbol,
+        "Stock": result.get("company_name") or symbol.replace(".NS", "").replace(".BO", ""),
         "Decision": result["decision"],
         "Revenue Growth": metrics.get("revenue_growth", "N/A"),
         "Profit Growth": metrics.get("net_profit_growth", "N/A"),
@@ -571,9 +855,9 @@ def _comparison_row(symbol, result, nifty_return, sensex_return):
         "Breakout Probability": breakout_probability,
         "Volatility": round(result["atr_pct"], 2),
         "Relative Strength": round(returns - (nifty_return or 0), 2),
-        "AI Score": scores["AI score"],
-        "Risk Score": round(risk_score, 2),
-        "Confidence Score": result["trade_confidence"],
+        "Quantara Score": scores["Quantara score"],
+        "Risk": result.get("risk_level"),
+        "Confidence Detail": result["trade_confidence"],
         "Swing Suitability": suitability,
         "Suggested Holding": result["holding_period"],
         "Risk/Reward Quality": round(result["risk_reward"], 2),
@@ -591,8 +875,9 @@ def render_stock_comparison():
     st.title("Stock Comparison")
     st.caption("Compare multi-factor strength, risk, growth, momentum, and AI conviction side-by-side.")
     section_help("Stock Comparison", "Compares up to five symbols using cached full AI analysis. Click Compare manually so tab switches do not trigger repeated yfinance requests.")
-    symbols_text = st.text_input("Symbols", value="RELIANCE.NS, TCS.NS, INFY.NS", help="Comma-separated tickers")
-    symbols = [item.strip().upper() for item in symbols_text.split(",") if item.strip()]
+    symbols_text = st.text_input("Stocks", value="Reliance, TCS, Infosys", help="Comma-separated company names or tickers")
+    resolved_symbols = [cached_resolve_symbol(item.strip()) for item in symbols_text.split(",") if item.strip()]
+    symbols = [item["ticker"] for item in resolved_symbols]
     if not symbols:
         st.info("Add at least one ticker to compare.")
         return
@@ -609,13 +894,16 @@ def render_stock_comparison():
         results = []
         nifty_return = _benchmark_return("^NSEI")
         sensex_return = _benchmark_return("^BSESN")
+        if nifty_return is None or sensex_return is None:
+            compact_alert("Benchmark data temporarily unavailable", "Comparison will continue without benchmark alpha until index data is available.", level="info")
         with st.spinner("Building comparative intelligence..."):
             for symbol in symbols:
                 try:
                     result = cached_stock_analysis(symbol)
                     results.append(_comparison_row(symbol, result, nifty_return, sensex_return))
                 except Exception as exc:
-                    compact_alert(f"{symbol} skipped", "Market data was unavailable or rate-limited for this symbol.", level="warn", details=exc)
+                    friendly = next((item.get("display_name") or item.get("name") for item in resolved_symbols if item.get("ticker") == symbol), symbol.replace(".NS", "").replace(".BO", ""))
+                    compact_alert(f"{friendly} skipped", "Market data was unavailable. Quantara kept the comparison running for the remaining stocks.", level="warn", details=exc)
         st.session_state["last_comparison"] = results
 
     if not results:
@@ -625,22 +913,26 @@ def render_stock_comparison():
     table = pd.DataFrame([{k: v for k, v in row.items() if not k.startswith("_")} for row in results])
     view = st.radio("Comparison View", ["Summary", "Fundamentals", "Technicals", "AI Analytics", "Market Comparison"], horizontal=True, label_visibility="collapsed")
     view_columns = {
-        "Summary": ["Ticker", "Decision", "AI Score", "Confidence Score", "Risk Score", "Swing Suitability", "Returns %", "Expected 30d %"],
-        "Fundamentals": ["Ticker", "Revenue Growth", "Profit Growth", "ROE", "ROCE", "Debt to Equity", "Operating Margin", "EPS Growth", "PE Ratio", "PB Ratio", "Promoter Holding", "Institutional Holding"],
-        "Technicals": ["Ticker", "RSI", "MACD", "MA20", "MA50", "Trend Strength", "Momentum Score", "Volume Strength", "Breakout Probability", "Volatility", "Relative Strength"],
-        "AI Analytics": ["Ticker", "AI Score", "Risk Score", "Confidence Score", "Swing Suitability", "Suggested Holding", "Risk/Reward Quality"],
-        "Market Comparison": ["Ticker", "Performance vs NIFTY", "Performance vs SENSEX", "Relative Alpha", "Returns %"],
+        "Summary": ["Stock", "Decision", "Quantara Score", "Risk", "Swing Suitability", "Returns %", "Expected 30d %"],
+        "Fundamentals": ["Stock", "Revenue Growth", "Profit Growth", "ROE", "ROCE", "Debt to Equity", "Operating Margin", "EPS Growth", "PE Ratio", "PB Ratio", "Promoter Holding", "Institutional Holding"],
+        "Technicals": ["Stock", "RSI", "MACD", "MA20", "MA50", "Trend Strength", "Momentum Score", "Volume Strength", "Breakout Probability", "Volatility", "Relative Strength"],
+        "AI Analytics": ["Stock", "Quantara Score", "Risk", "Confidence Detail", "Swing Suitability", "Suggested Holding", "Risk/Reward Quality"],
+        "Market Comparison": ["Stock", "Performance vs NIFTY", "Performance vs SENSEX", "Relative Alpha", "Returns %"],
     }
     st.dataframe(table[[col for col in view_columns[view] if col in table.columns]], use_container_width=True, hide_index=True)
+    csv_download(table[[col for col in view_columns[view] if col in table.columns]], f"quantara_stock_comparison_{view.lower().replace(' ', '_')}.csv", key=f"comparison_{view}_csv")
 
-    radar_metrics = ["AI score", "Fundamental score", "Technical score", "Momentum", "Risk quality", "Volatility quality"]
+    radar_metrics = ["Quantara score", "Fundamental score", "Technical score", "Momentum", "Risk quality", "Volatility quality"]
     radar = go.Figure()
-    for row in results:
-        values = [row[metric] for metric in radar_metrics]
-        radar.add_trace(go.Scatterpolar(r=values + [values[0]], theta=radar_metrics + [radar_metrics[0]], fill="toself", name=row["Ticker"]))
-    radar.update_polars(bgcolor="rgba(8,24,43,.78)", radialaxis=dict(range=[0, 100], gridcolor="rgba(130,177,206,.18)"))
-    apply_chart_theme(radar, height=460, title="Factor Radar")
-    st.plotly_chart(radar, use_container_width=True)
+    try:
+        for row in results:
+            values = [float(row.get(metric, 0) or 0) for metric in radar_metrics]
+            radar.add_trace(go.Scatterpolar(r=values + [values[0]], theta=radar_metrics + [radar_metrics[0]], fill="toself", name=row["Stock"]))
+        radar.update_polars(bgcolor="rgba(8,24,43,.78)", radialaxis=dict(range=[0, 100], gridcolor="rgba(130,177,206,.18)"))
+        apply_chart_theme(radar, height=460, title="Factor Radar")
+        st.plotly_chart(radar, use_container_width=True, config={"displaylogo": False})
+    except Exception as exc:
+        compact_alert("Radar chart unavailable", "The comparison table is available, but the radar chart could not render for this batch.", level="info", details=exc)
 
     perf = go.Figure()
     palette = [CYAN, GREEN, BLUE, YELLOW, RED]
@@ -648,20 +940,106 @@ def render_stock_comparison():
         hist = row["_history"]
         if len(hist) > 1:
             indexed = (hist / hist.iloc[0]) * 100
-            perf.add_trace(go.Scatter(x=indexed.index, y=indexed.values, mode="lines", name=row["Ticker"], line=dict(color=palette[idx % len(palette)], width=3)))
+            perf.add_trace(go.Scatter(x=indexed.index, y=indexed.values, mode="lines", name=row["Stock"], line=dict(color=palette[idx % len(palette)], width=3)))
     apply_chart_theme(perf, height=430, title="Relative Performance Indexed to 100")
-    st.plotly_chart(perf, use_container_width=True)
+    st.plotly_chart(perf, use_container_width=True, config={"displaylogo": False})
 
 
-mode = render_sidebar_tools()
+def _fund_metrics(symbol, benchmark_symbol="^NSEI"):
+    hist = cached_history(symbol, "5y")
+    close = hist["Close"].dropna() if not hist.empty else pd.Series(dtype=float)
+    info = safe_info(symbol)
+    if len(close) < 2:
+        return None
+    years = max((close.index[-1] - close.index[0]).days / 365.25, 0.1)
+    total_return = ((float(close.iloc[-1]) / float(close.iloc[0])) - 1) * 100
+    cagr = ((float(close.iloc[-1]) / float(close.iloc[0])) ** (1 / years) - 1) * 100
+    rolling_1y = close.pct_change(252).dropna() * 100
+    drawdown = ((close / close.cummax()) - 1).min() * 100
+    volatility = close.pct_change().dropna().std() * (252 ** 0.5) * 100
+    benchmark_return = _benchmark_return(benchmark_symbol)
+    risk_score = max(0, min(100, 85 - abs(drawdown) * 1.2 - volatility * 0.7))
+    return {
+        "Fund": info.get("shortName") or symbol,
+        "Symbol": symbol,
+        "Category": info.get("category") or info.get("quoteType") or "Fund",
+        "NAV / Price": round(float(close.iloc[-1]), 2),
+        "Total Return %": round(total_return, 2),
+        "CAGR %": round(cagr, 2),
+        "Rolling 1Y Median %": round(float(rolling_1y.median()), 2) if not rolling_1y.empty else "N/A",
+        "Best Rolling 1Y %": round(float(rolling_1y.max()), 2) if not rolling_1y.empty else "N/A",
+        "Worst Rolling 1Y %": round(float(rolling_1y.min()), 2) if not rolling_1y.empty else "N/A",
+        "Max Drawdown %": round(float(drawdown), 2),
+        "Volatility %": round(float(volatility), 2),
+        "Benchmark Alpha %": round(total_return - benchmark_return, 2) if benchmark_return is not None else "N/A",
+        "Expense Ratio": info.get("annualReportExpenseRatio") or info.get("expenseRatio") or "N/A",
+        "Risk Quality": round(risk_score, 2),
+        "Quantara Fund Score": round(max(0, min(100, cagr * 2.2 + risk_score * 0.55)), 2),
+        "_history": close,
+    }
 
-if mode == "Stock Terminal":
-    render_stock_terminal()
-elif mode == "Portfolio":
-    render_portfolio()
-elif mode == "Stock Basket":
-    render_basket()
-else:
-    render_stock_comparison()
+
+def render_mutual_funds():
+    st.title("Mutual Funds")
+    st.caption("Fund research, rolling-return quality, risk, SIP projection, and benchmark comparison.")
+    symbols_text = st.text_input("Fund symbols", value="", placeholder="Enter fund names or provider symbols", help="Comma-separated fund identifiers")
+    benchmark = st.selectbox("Benchmark", ["^NSEI", "^BSESN"], format_func=lambda item: "NIFTY 50" if item == "^NSEI" else "SENSEX")
+    sip_cols = st.columns(3)
+    sip_amount = sip_cols[0].number_input("Monthly SIP", min_value=500, value=10000, step=500)
+    sip_years = sip_cols[1].number_input("Years", min_value=1, max_value=40, value=10)
+    sip_return = sip_cols[2].number_input("Expected CAGR %", min_value=1.0, max_value=30.0, value=12.0, step=0.5)
+    monthly_rate = (sip_return / 100) / 12
+    months = int(sip_years * 12)
+    sip_value = sip_amount * (((1 + monthly_rate) ** months - 1) / monthly_rate) * (1 + monthly_rate) if monthly_rate else sip_amount * months
+    st.metric("Projected SIP Value", format_currency(sip_value, ticker="NIFTY.NS", compact=True))
+
+    if not st.button("Analyze Funds"):
+        compact_alert("Ready to analyze", "Add fund symbols and click Analyze Funds. CSV export appears with the analysis table.", level="info")
+        return
+    rows = []
+    with st.spinner("Analyzing mutual fund history..."):
+        for symbol in [item.strip().upper() for item in symbols_text.split(",") if item.strip()]:
+            try:
+                metrics = _fund_metrics(symbol, benchmark)
+                if metrics:
+                    rows.append(metrics)
+            except Exception as exc:
+                compact_alert(f"{symbol} skipped", "Fund data was unavailable from the provider.", level="warn", details=exc)
+    if not rows:
+        compact_alert("No fund data", "Try valid Yahoo Finance fund symbols or ETFs.", level="error")
+        return
+    table = pd.DataFrame([{k: v for k, v in row.items() if not k.startswith("_")} for row in rows])
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    csv_download(table, "quantara_mutual_fund_analysis.csv", key="mutual_fund_csv")
+
+    fig = go.Figure()
+    for row in rows:
+        hist = row["_history"]
+        indexed = (hist / hist.iloc[0]) * 100
+        fig.add_trace(go.Scatter(x=indexed.index, y=indexed.values, mode="lines", name=row["Symbol"]))
+    apply_chart_theme(fig, height=430, title="Fund Growth Indexed to 100")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+try:
+    mode = render_sidebar_tools()
+
+    if mode == "Stock Terminal":
+        render_stock_terminal()
+    elif mode == "Portfolio":
+        render_portfolio()
+    elif mode == "Swing Basket":
+        render_basket()
+    elif mode == "Long Term Investing":
+        render_investing_basket()
+    else:
+        render_stock_comparison()
+except Exception as exc:
+    compact_alert(
+        "This workspace could not finish loading",
+        "Quantara recovered from an internal error. Please retry the action or switch to another workspace while cached data refreshes.",
+        level="error",
+        details=exc,
+    )
 
 footer()

@@ -2,6 +2,10 @@ import os
 import requests
 import yfinance as yf
 
+import config
+from providers.manager import provider_manager
+from utils.observability import log_provider_failure
+
 API_KEY = os.getenv("NEWSAPI_KEY", "YOUR_NEWSAPI_KEY")
 
 POSITIVE_TERMS = {
@@ -110,15 +114,22 @@ def get_newsapi_news(ticker, limit=8):
 
 
 def get_news(ticker):
+    if not config.ENABLE_NEWS:
+        return []
     if API_KEY != "YOUR_NEWSAPI_KEY":
         try:
             articles = get_newsapi_news(ticker)
             if articles:
                 return articles
-        except Exception:
-            pass
+        except Exception as exc:
+            log_provider_failure("NewsAPI", "get_news", ticker, exc)
 
-    return get_yfinance_news(ticker)
+    try:
+        raw = provider_manager.get_news(ticker)
+        return [_normalize_yfinance_item(item) for item in raw[:8]] if raw else []
+    except Exception as exc:
+        log_provider_failure("DataProviderManager", "get_news", ticker, exc)
+        return get_yfinance_news(ticker)
 
 
 def aggregate_news_sentiment(articles):

@@ -47,6 +47,32 @@ def _profit_factor(trade_returns):
     return round(gains / losses, 2)
 
 
+def _cagr(initial_capital, ending_capital, start_date, end_date):
+    days = max((end_date - start_date).days, 1)
+    years = days / 365.25
+    if initial_capital <= 0 or ending_capital <= 0 or years <= 0:
+        return 0
+    return ((ending_capital / initial_capital) ** (1 / years) - 1) * 100
+
+
+def _monthly_performance(trades):
+    months = {}
+    for trade in trades:
+        month = str(trade.get("exit_date", ""))[:7]
+        if not month:
+            continue
+        months.setdefault(month, []).append(float(trade.get("return_pct", 0) or 0))
+    return [
+        {
+            "month": month,
+            "trades": len(values),
+            "avg_return_pct": round(sum(values) / len(values), 2),
+            "win_rate": round(sum(1 for value in values if value > 0) / len(values) * 100, 2),
+        }
+        for month, values in sorted(months.items())
+    ]
+
+
 def _strategy_signal(window, risk_level="Balanced", min_confidence=62):
     close = window["Close"]
     weekly = close.resample("W").last().dropna()
@@ -187,6 +213,10 @@ def run_backtest(
     avg_return = sum(trade["return_pct"] for trade in trades) / len(trades) if trades else 0
     win_rate = (len(wins) / len(trades)) * 100 if trades else 0
     roi = ((capital / initial_capital) - 1) * 100 if initial_capital else 0
+    best_trade = max(trades, key=lambda item: item["return_pct"]) if trades else None
+    worst_trade = min(trades, key=lambda item: item["return_pct"]) if trades else None
+    cagr = _cagr(initial_capital, capital, df.index[120].date(), df.index[-1].date())
+    strategy_confidence = max(0, min(100, (win_rate * 0.45) + (max(0, roi) * 0.35) + (max(0, _profit_factor(trade_returns)) * 8) - (_max_drawdown([item["capital"] for item in equity_curve]) * 0.5)))
 
     status = "ok" if trades else "no_trades"
     message = "Backtest completed." if trades else "No valid entries matched the selected risk settings in this period."
@@ -201,12 +231,18 @@ def run_backtest(
             "total_trades": len(trades),
             "win_rate": round(win_rate, 2),
             "roi": round(roi, 2),
+            "total_return": round(roi, 2),
+            "cagr": round(cagr, 2),
             "avg_return": round(avg_return, 2),
             "max_drawdown": round(_max_drawdown([item["capital"] for item in equity_curve]), 2),
             "sharpe": round(_sharpe(trade_returns), 2),
             "profit_factor": _profit_factor(trade_returns),
-            "ending_capital": round(capital, 2)
-        }
+            "ending_capital": round(capital, 2),
+            "best_trade": best_trade,
+            "worst_trade": worst_trade,
+            "strategy_confidence": round(strategy_confidence, 2),
+        },
+        "monthly_performance": _monthly_performance(trades),
     }
 
 
@@ -221,12 +257,18 @@ def _empty_backtest(ticker, initial_capital, message):
             "total_trades": 0,
             "win_rate": 0,
             "roi": 0,
+            "total_return": 0,
+            "cagr": 0,
             "avg_return": 0,
             "max_drawdown": 0,
             "sharpe": 0,
             "profit_factor": 0,
-            "ending_capital": float(initial_capital)
-        }
+            "ending_capital": float(initial_capital),
+            "best_trade": None,
+            "worst_trade": None,
+            "strategy_confidence": 0,
+        },
+        "monthly_performance": [],
     }
 
 
